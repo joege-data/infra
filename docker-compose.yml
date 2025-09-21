@@ -1,0 +1,67 @@
+version: "3.9"
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-07-18T17-19-28Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [ "minio_data:/data" ]
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.99.0
+    environment:
+      QUARKUS_HTTP_PORT: 19120
+      # Iceberg REST + S3 warehouse
+      nessie.catalog.default-warehouse: warehouse
+      nessie.catalog.warehouses.warehouse.location: s3://lakehouse
+      nessie.s3.endpoint: http://minio:9000
+      nessie.s3.access-key-id: ${MINIO_ROOT_USER}
+      nessie.s3.secret-access-key: ${MINIO_ROOT_PASSWORD}
+      nessie.s3.path-style-access: "true"
+    depends_on: [minio]
+    ports: ["19120:19120"]
+
+  trino:
+    image: trinodb/trino:442
+    ports: ["8080:8080"]
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog
+    depends_on: [minio, nessie]
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda start --overprovisioned --smp 1 --memory 1G
+        --reserve-memory 0M --check=false --set redpanda.enable_idempotence=true
+    ports: ["9092:9092","9644:9644"]
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.8.2
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports: ["8081:8080"]
+    depends_on: [redpanda]
+
+  airflow:
+    build:
+      context: ../pipelines/airflow
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__RBAC: "true"
+      AIRFLOW__WEBSERVER__BASE_URL: http://airflow:8082
+      AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX: "True"
+    volumes:
+      - ../pipelines/airflow/dags:/opt/airflow/dags
+      - ../pipelines/airflow/requirements.txt:/requirements.txt
+    command: >
+      bash -lc "pip install -r /requirements.txt &&
+                airflow db init &&
+                airflow users create --username admin --password admin --firstname a --lastname d --role Admin --email a@b.c || true &&
+                airflow webserver -p 8082 & airflow scheduler"
+    ports: ["8082:8082"]
+    depends_on: [trino, minio, nessie]
+
+volumes:
+  minio_data:
